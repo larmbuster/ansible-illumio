@@ -1,0 +1,97 @@
+---
+- name: Deploy Illumio VEN to Windows Servers
+  hosts: windows_servers
+  vars:
+    pce_hostname: "your-pce-hostname.example.com"
+    pce_port: 8444
+    ven_version: "23.2.0-1234"
+    windows_pairing_key: "5678-9012-3456-7890"
+    env_label: "Production"
+    app_label: "Finance"
+    loc_label: "DataCenter1"
+    role_label: "WebServer"
+    temp_dir: "C:\\Temp"
+  tasks:
+    - name: Create temp directory if it doesn't exist
+      ansible.windows.win_file:
+        path: "{{ temp_dir }}"
+        state: directory
+
+    - name: Test connectivity to Illumio PCE
+      ansible.windows.win_uri:
+        url: "https://{{ pce_hostname }}:{{ pce_port }}"
+        method: GET
+        validate_certs: no
+        status_code: [200, 302, 403, 404]  # Accept these status codes
+      register: pce_connectivity
+      ignore_errors: yes
+
+    - name: Fail if PCE is not reachable
+      ansible.builtin.fail:
+        msg: "Cannot reach PCE at {{ pce_hostname }}:{{ pce_port }}. Please check network connectivity."
+      when: pce_connectivity.status is not defined or pce_connectivity.status < 0
+
+    - name: Download Illumio VEN package for Windows
+      ansible.windows.win_get_url:
+        url: "https://{{ pce_hostname }}:{{ pce_port }}/software/agent/ven-msi-{{ ven_version }}.msi"
+        dest: "{{ temp_dir }}\\illumio-ven.msi"
+        validate_certs: no
+      register: download_result
+
+    - name: Check if Illumio VEN is already installed
+      ansible.windows.win_shell: Get-WmiObject -Class Win32_Product | Where-Object {$_.Name -like "*Illumio*"} | Select-Object -ExpandProperty Name
+      register: installed_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Install Illumio VEN
+      ansible.windows.win_package:
+        path: "{{ temp_dir }}\\illumio-ven.msi"
+        state: present
+        arguments: /quiet
+      register: install_result
+      when: installed_check.stdout == ""
+
+    - name: Check if Illumio service is running
+      ansible.windows.win_service:
+        name: IllumioVEN
+        state: started
+      register: service_result
+      ignore_errors: yes
+      
+    - name: Pause to allow installation to complete
+      ansible.windows.win_shell: Start-Sleep -Seconds 10
+      when: install_result.changed
+      
+    - name: Clean up temporary files
+      ansible.windows.win_file:
+        path: "{{ temp_dir }}\\illumio-ven.msi"
+        state: absent
+      when: install_result.changed
+
+    - name: Pair VEN with PCE
+      ansible.windows.win_shell: |
+        & 'C:\Program Files\Illumio\illumio-ven-ctl.ps1' activate `
+          --management-server https://{{ pce_hostname }}:{{ pce_port }} `
+          --activation-code {{ windows_pairing_key }} `
+          --mode illuminated `
+          --env "{{ env_label }}" `
+          --loc "{{ loc_label }}" `
+          --app "{{ app_label }}" `
+          --role "{{ role_label }}"
+      register: pairing_result
+      changed_when: "'Successfully' in pairing_result.stdout"
+      failed_when: 
+        - pairing_result.rc != 0
+        - "'already activated' not in pairing_result.stderr"
+        - "'Successfully' not in pairing_result.stdout"
+
+    - name: Validate VEN status
+      ansible.windows.win_shell: '& C:\Program Files\Illumio\illumio-ven-ctl.ps1 status'
+      register: status_result
+      changed_when: false
+      failed_when: "'Agent State: active' not in status_result.stdout and 'Agent State: illuminated' not in status_result.stdout"
+
+    - name: Display VEN status
+      ansible.builtin.debug:
+        var: status_result.stdout_lines

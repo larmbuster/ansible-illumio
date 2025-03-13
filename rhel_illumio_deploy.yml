@@ -1,0 +1,87 @@
+---
+- name: Deploy Illumio VEN to RHEL Servers
+  hosts: rhel_servers
+  become: true
+  vars:
+    pce_hostname: "your-pce-hostname.example.com"
+    pce_port: 8444
+    ven_version: "23.2.0-1234"
+    rhel_pairing_key: "1234-5678-9012-3456"
+    env_label: "Production"
+    app_label: "Finance"
+    loc_label: "DataCenter1"
+    role_label: "WebServer"
+  tasks:
+    - name: Check connectivity to Illumio PCE
+      ansible.builtin.uri:
+        url: "https://{{ pce_hostname }}:{{ pce_port }}"
+        method: GET
+        validate_certs: false
+        status_code: [200, 302, 403, 404]  # Accept these status codes as PCE might redirect or require auth
+      register: pce_connectivity
+      ignore_errors: true
+
+    - name: Fail if PCE is not reachable
+      ansible.builtin.fail:
+        msg: "Cannot reach PCE at {{ pce_hostname }}:{{ pce_port }}. Please check network connectivity."
+      when: pce_connectivity.status is not defined or pce_connectivity.status < 0
+
+    - name: Download Illumio VEN package for RHEL
+      ansible.builtin.get_url:
+        url: "https://{{ pce_hostname }}:{{ pce_port }}/software/agent/ven-rpm-{{ ven_version }}.rpm"
+        dest: "/tmp/illumio-ven.rpm"
+        validate_certs: false
+        mode: '0644'
+      register: download_result
+
+    - name: Install required packages
+      ansible.builtin.package:
+        name:
+          - curl
+          - yum-utils
+        state: present
+
+    - name: Install Illumio VEN package
+      ansible.builtin.package:
+        name: "/tmp/illumio-ven.rpm"
+        state: present
+        disable_gpg_check: true
+      register: install_result
+
+    - name: Clean up temporary files
+      ansible.builtin.file:
+        path: "/tmp/illumio-ven.rpm"
+        state: absent
+      when: install_result.changed
+
+    - name: Activate VEN and pair with PCE
+      ansible.builtin.command: >
+        /opt/illumio_ven/illumio-ven-ctl activate
+        --management-server https://{{ pce_hostname }}:{{ pce_port }}
+        --activation-code {{ rhel_pairing_key }}
+        --mode illuminated
+        --env {{ env_label }}
+        --loc {{ loc_label }}
+        --app {{ app_label }}
+        --role {{ role_label }}
+      register: pairing_result
+      changed_when: "'Successfully' in pairing_result.stdout"
+      failed_when:
+        - pairing_result.rc != 0
+        - "'already activated' not in pairing_result.stderr"
+
+    - name: Validate VEN status
+      ansible.builtin.command: /opt/illumio_ven/illumio-ven-ctl status
+      register: status_result
+      changed_when: false
+      failed_when: "'Agent State: active' not in status_result.stdout and 'Agent State: illuminated' not in status_result.stdout"
+
+    - name: Display VEN status
+      ansible.builtin.debug:
+        var: status_result.stdout_lines
+
+    - name: Start and enable illumio-ven service
+      ansible.builtin.systemd:
+        name: illumio-ven
+        state: started
+        enabled: true
